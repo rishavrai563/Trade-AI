@@ -21,7 +21,7 @@ requirements.txt  # Python dependencies
 ## Installation
 1. Clone the repository:
    ```bash
-   git clone <repo-url>
+   git clone https://github.com/rishavrai563/Trade-AI.git
    cd TradeAI
    ```
 2. Install dependencies:

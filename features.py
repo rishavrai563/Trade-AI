@@ -1,151 +1,150 @@
 """
-TradeAI Feature Engineering - Technical Indicators
+QuantAI Feature Engineering — Alpha Factors for ML Filter
 """
 
 import pandas as pd
 import numpy as np
-from config import FEATURES, PREDICTION_DAYS
+from config import (
+    RETURN_WINDOWS, SMA_WINDOWS, EMA_WINDOWS, RSI_PERIODS, VOL_WINDOWS,
+)
 
 
-def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
-    """Relative Strength Index - momentum oscillator."""
-    delta = prices.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
-    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+# ─────────────────────────────────────────────────────────────────────────────
+# Alpha Factors for ML Filter
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def calculate_macd(prices: pd.Series):
-    """MACD - trend following momentum indicator."""
-    ema_fast = prices.ewm(span=12, adjust=False).mean()
-    ema_slow = prices.ewm(span=26, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    signal = macd.ewm(span=9, adjust=False).mean()
-    histogram = macd - signal
-    return macd, signal, histogram
-
-
-def calculate_bollinger(prices: pd.Series, period: int = 20, std: float = 2.0):
-    """Bollinger Bands - volatility indicator."""
-    sma = prices.rolling(window=period).mean()
-    rolling_std = prices.rolling(window=period).std()
-    upper = sma + (rolling_std * std)
-    lower = sma - (rolling_std * std)
-    width = (upper - lower) / sma
-    return upper, lower, width
-
-
-def calculate_stochastic(high: pd.Series, low: pd.Series, close: pd.Series):
-    """Stochastic Oscillator - momentum indicator."""
-    lowest = low.rolling(window=14).min()
-    highest = high.rolling(window=14).max()
-    k = 100 * (close - lowest) / (highest - lowest)
-    d = k.rolling(window=3).mean()
-    return k, d
-
-
-def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
-    """Average True Range - volatility measure."""
-    tr1 = high - low
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low - close.shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
-
-
-def calculate_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-    """On-Balance Volume - volume-based indicator."""
-    obv = pd.Series(index=close.index, dtype=float)
-    obv.iloc[0] = volume.iloc[0]
-    for i in range(1, len(close)):
-        if close.iloc[i] > close.iloc[i - 1]:
-            obv.iloc[i] = obv.iloc[i - 1] + volume.iloc[i]
-        elif close.iloc[i] < close.iloc[i - 1]:
-            obv.iloc[i] = obv.iloc[i - 1] - volume.iloc[i]
-        else:
-            obv.iloc[i] = obv.iloc[i - 1]
-    return obv
-
-
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add all technical indicators to dataframe."""
+def build_ml_features(df):
+    """
+    Build features for the ML filter model.
+    These capture market conditions to predict if a rule signal will work.
+    """
     data = df.copy()
 
-    # Simple Moving Averages
-    data['SMA_5'] = data['Close'].rolling(5).mean()
-    data['SMA_10'] = data['Close'].rolling(10).mean()
-    data['SMA_20'] = data['Close'].rolling(20).mean()
-    data['SMA_50'] = data['Close'].rolling(50).mean()
-
-    # Exponential Moving Averages
-    data['EMA_12'] = data['Close'].ewm(span=12, adjust=False).mean()
-    data['EMA_26'] = data['Close'].ewm(span=26, adjust=False).mean()
-
-    # MACD
-    data['MACD'], data['MACD_Signal'], data['MACD_Hist'] = calculate_macd(data['Close'])
+    # Returns
+    for w in RETURN_WINDOWS:
+        data[f'ret_{w}d'] = np.log(data['Close'] / data['Close'].shift(w))
 
     # RSI
-    data['RSI'] = calculate_rsi(data['Close'])
+    for p in RSI_PERIODS:
+        delta = data['Close'].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+        avg_g = gain.ewm(com=p-1, min_periods=p).mean()
+        avg_l = loss.ewm(com=p-1, min_periods=p).mean()
+        data[f'rsi_{p}'] = 100 - (100 / (1 + avg_g / avg_l))
+
+    # MACD histogram
+    ema12 = data['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = data['Close'].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    data['macd_hist'] = macd - macd.ewm(span=9, adjust=False).mean()
+
+    # SMA crossover distances
+    for w in SMA_WINDOWS:
+        data[f'_sma_{w}'] = data['Close'].rolling(w).mean()
+
+    data['sma_x_10_50'] = (data['_sma_10'] - data['_sma_50']) / data['Close']
+    data['sma_x_50_200'] = (data['_sma_50'] - data['_sma_200']) / data['Close']
+    data['price_vs_sma_20'] = (data['Close'] - data['_sma_20']) / data['_sma_20']
+    data['price_vs_sma_50'] = (data['Close'] - data['_sma_50']) / data['_sma_50']
+
+    # ADX (if not already present)
+    if 'adx' not in data.columns:
+        hdiff = data['High'].diff()
+        ldiff = -data['Low'].diff()
+        pdm = hdiff.where((hdiff > ldiff) & (hdiff > 0), 0.0)
+        mdm = ldiff.where((ldiff > hdiff) & (ldiff > 0), 0.0)
+        tr = pd.concat([
+            data['High'] - data['Low'],
+            (data['High'] - data['Close'].shift()).abs(),
+            (data['Low'] - data['Close'].shift()).abs()
+        ], axis=1).max(axis=1)
+        atr14 = tr.ewm(span=14, adjust=False).mean()
+        pdi = 100 * pdm.ewm(span=14, adjust=False).mean() / atr14
+        mdi = 100 * mdm.ewm(span=14, adjust=False).mean() / atr14
+        dx = 100 * (pdi - mdi).abs() / (pdi + mdi)
+        data['adx'] = dx.ewm(span=14, adjust=False).mean()
+
+    # Bollinger
+    sma20 = data['Close'].rolling(20).mean()
+    std20 = data['Close'].rolling(20).std()
+    upper = sma20 + 2 * std20
+    lower = sma20 - 2 * std20
+    data['bb_pct'] = (data['Close'] - lower) / (upper - lower)
+    data['bb_width'] = (upper - lower) / sma20
+
+    # Z-scores
+    for w in [20, 50]:
+        sma = data['Close'].rolling(w).mean()
+        std = data['Close'].rolling(w).std()
+        data[f'zscore_{w}'] = (data['Close'] - sma) / std
+
+    # Volatility
+    log_ret = np.log(data['Close'] / data['Close'].shift(1))
+    for w in VOL_WINDOWS:
+        data[f'rvol_{w}'] = log_ret.rolling(w).std() * np.sqrt(252)
+
+    # ATR %
+    tr = pd.concat([
+        data['High'] - data['Low'],
+        (data['High'] - data['Close'].shift()).abs(),
+        (data['Low'] - data['Close'].shift()).abs()
+    ], axis=1).max(axis=1)
+    for w in [10, 20]:
+        data[f'atr_pct_{w}'] = tr.ewm(span=w, adjust=False).mean() / data['Close']
+
+    # Volume
+    for w in [20, 60]:
+        vm = data['Volume'].rolling(w).mean()
+        vs = data['Volume'].rolling(w).std()
+        data[f'vol_zscore_{w}'] = (data['Volume'] - vm) / vs
 
     # Stochastic
-    data['Stochastic_K'], data['Stochastic_D'] = calculate_stochastic(
-        data['High'], data['Low'], data['Close']
-    )
+    lo14 = data['Low'].rolling(14).min()
+    hi14 = data['High'].rolling(14).max()
+    data['stoch_k'] = 100 * (data['Close'] - lo14) / (hi14 - lo14)
 
-    # Williams %R
-    highest = data['High'].rolling(14).max()
-    lowest = data['Low'].rolling(14).min()
-    data['Williams_R'] = -100 * (highest - data['Close']) / (highest - lowest)
+    # Volume ratio
+    data['vol_ratio'] = data['Volume'] / data['Volume'].rolling(20).mean()
 
-    # Rate of Change
-    data['ROC'] = ((data['Close'] - data['Close'].shift(10)) / data['Close'].shift(10)) * 100
+    # Regime features
+    sv = log_ret.rolling(10).std() * np.sqrt(252)
+    lv = log_ret.rolling(60).std() * np.sqrt(252)
+    data['vol_regime'] = sv / lv
 
-    # ATR
-    data['ATR'] = calculate_atr(data['High'], data['Low'], data['Close'])
+    # Hurst
+    def hurst_rs(s):
+        if len(s) < 20:
+            return np.nan
+        m = s.mean()
+        c = (s - m).cumsum()
+        R = c.max() - c.min()
+        S = s.std()
+        return np.log(R / S) / np.log(len(s)) if S > 0 else np.nan
+    data['hurst'] = log_ret.rolling(60).apply(hurst_rs, raw=True)
 
-    # Bollinger Bands
-    data['Bollinger_Upper'], data['Bollinger_Lower'], data['Bollinger_Width'] = calculate_bollinger(data['Close'])
+    # Distance from highs/lows
+    for w in [20, 60]:
+        data[f'dist_high_{w}'] = (data['Close'] - data['High'].rolling(w).max()) / data['Close']
+        data[f'dist_low_{w}'] = (data['Close'] - data['Low'].rolling(w).min()) / data['Close']
 
-    # OBV
-    data['OBV'] = calculate_obv(data['Close'], data['Volume'])
+    # CMF
+    clv = ((data['Close'] - data['Low']) - (data['High'] - data['Close']))
+    hl = (data['High'] - data['Low']).replace(0, np.nan)
+    mfv = (clv / hl) * data['Volume']
+    data['cmf'] = mfv.rolling(20).sum() / data['Volume'].rolling(20).sum()
 
-    # Volume indicators
-    data['Volume_SMA'] = data['Volume'].rolling(20).mean()
-    data['Volume_Ratio'] = data['Volume'] / data['Volume_SMA']
-
-    # Price patterns
-    data['Price_Change'] = data['Close'].pct_change()
-    data['High_Low_Ratio'] = (data['High'] - data['Low']) / data['Close']
-    data['Close_Open_Ratio'] = (data['Close'] - data['Open']) / data['Open']
-
-    return data
-
-
-def add_target(df: pd.DataFrame, prediction_days: int = PREDICTION_DAYS) -> pd.DataFrame:
-    """Add binary target: 1 if price goes up by >0.5% in N days."""
-    data = df.copy()
-    future_return = (data['Close'].shift(-prediction_days) - data['Close']) / data['Close']
-    data['Target'] = (future_return > 0.005).astype(int)
-    return data
-
-
-def prepare_data(df: pd.DataFrame, prediction_days: int = PREDICTION_DAYS) -> pd.DataFrame:
-    """Complete data preparation pipeline."""
-    data = add_features(df)
-    data = add_target(data, prediction_days=prediction_days)
+    # Clean
     data = data.replace([np.inf, -np.inf], np.nan)
     data = data.dropna()
 
-    if len(data) == 0:
-        raise ValueError("No data remaining after preprocessing")
+    # Feature columns (exclude OHLCV, intermediates, strategy indicators)
+    exclude = {'Open', 'High', 'Low', 'Close', 'Volume',
+               'fast_ma', 'slow_ma', 'ma_200', 'rsi', 'macd', 'macd_signal',
+               'plus_di', 'minus_di', 'bb_upper', 'bb_lower',
+               'stoch_d', 'vol_sma', 'atr', 'label', 'holding_period', 'target'}
+    exclude |= {f'_sma_{w}' for w in SMA_WINDOWS}
 
-    # Print class distribution
-    up = (data['Target'] == 1).sum()
-    down = (data['Target'] == 0).sum()
-    print(f"✓ Prepared {len(data)} samples with {len(FEATURES)} features")
-    print(f"  Class distribution: UP={up} ({up/len(data):.1%}), DOWN={down} ({down/len(data):.1%})")
+    feature_cols = sorted([c for c in data.columns if c not in exclude])
 
-    return data
+    return data, feature_cols

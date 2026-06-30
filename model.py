@@ -1,335 +1,387 @@
 """
-TradeAI Model - Bidirectional LSTM with Attention and CUDA/CPU runtime setup
+QuantAI ML Filter — Lightweight classifier to filter rule-based signals.
+
+The ML model does NOT generate the trading signal.
+It only answers: "Is this rule-based signal likely to be correct?"
+
+This is the meta-labeling approach from López de Prado.
 """
 
-import os
 import time
 import numpy as np
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    balanced_accuracy_score,
-    matthews_corrcoef,
-)
-from sklearn.utils.class_weight import compute_class_weight
+import pandas as pd
 from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import accuracy_score, balanced_accuracy_score
+import xgboost as xgb
+import lightgbm as lgb
 
 from config import (
-    LSTM_UNITS_1, LSTM_UNITS_2, LSTM_UNITS_3,
-    DROPOUT_RATE, RECURRENT_DROPOUT, LEARNING_RATE,
-    EARLY_STOP_PATIENCE, LR_REDUCE_PATIENCE, LR_REDUCE_FACTOR, MIN_LR,
-    CONFIDENCE_THRESHOLD, PREDICTION_DAYS, BATCH_SIZE,
-    USE_GPU, USE_MIXED_PRECISION, USE_XLA, PREFETCH_BUFFER
+    XGB_PARAMS, LGBM_PARAMS, ML_FILTER_THRESHOLD,
+    TRAIN_MIN_DAYS, WALK_FORWARD_STEP, CV_PURGE_GAP,
+    MAX_FEATURES, CORRELATION_THRESHOLD,
+    SAMPLE_WEIGHT_DECAY,
+    BARRIER_HORIZON, BARRIER_TP_MULT, BARRIER_SL_MULT,
 )
 
 
-def setup_compute_backend():
-    """Configure runtime to use CUDA GPU when available, else CPU."""
-    import tensorflow as tf
-    from tensorflow.keras import mixed_precision
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature Selection
+# ─────────────────────────────────────────────────────────────────────────────
 
-    print("\n" + "=" * 50)
-    print("  COMPUTE BACKEND SETUP")
-    print("=" * 50)
+def select_features(X_df, y, feature_cols, max_features=MAX_FEATURES,
+                    corr_threshold=CORRELATION_THRESHOLD):
+    """Reduce features via correlation filter + importance ranking."""
+    corr_matrix = X_df[feature_cols].corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = set()
+    for col in upper.columns:
+        correlated = upper.index[upper[col] > corr_threshold].tolist()
+        if correlated:
+            to_drop.add(col)
 
-    gpus = tf.config.list_physical_devices('GPU')
-    use_gpu = bool(gpus) and USE_GPU
+    surviving = [c for c in feature_cols if c not in to_drop]
+    print(f"  Corr filter: {len(feature_cols)} → {len(surviving)}")
 
-    if use_gpu:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"✓ CUDA GPU detected: {len(gpus)} device(s)")
-            for idx, gpu in enumerate(gpus):
-                print(f"  - GPU {idx}: {gpu.name}")
-        except Exception as e:
-            print(f"⚠ Could not enable memory growth: {e}")
+    if len(surviving) > max_features:
+        clf = xgb.XGBClassifier(
+            n_estimators=50, max_depth=3, learning_rate=0.1,
+            random_state=42, n_jobs=-1, eval_metric='logloss',
+        )
+        y_bin = (y > 0).astype(int) if not np.all(np.isin(y, [0, 1])) else y
+        clf.fit(X_df[surviving].values, y_bin)
+        imp = clf.feature_importances_
+        ranked = sorted(zip(surviving, imp), key=lambda x: x[1], reverse=True)
+        surviving = [n for n, _ in ranked[:max_features]]
+        print(f"  Importance: → {len(surviving)} features")
 
-        if USE_MIXED_PRECISION:
-            mixed_precision.set_global_policy('mixed_float16')
-            print("✓ Mixed precision enabled (mixed_float16)")
-        else:
-            mixed_precision.set_global_policy('float32')
-            print("✓ Mixed precision disabled (float32)")
+    return surviving
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triple Barrier Labels (for ML training)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def triple_barrier_labels(df, horizon=BARRIER_HORIZON,
+                          tp_mult=BARRIER_TP_MULT, sl_mult=BARRIER_SL_MULT):
+    """Label each row: +1 (TP hit), -1 (SL hit), 0 (neither)."""
+    close = df['Close'].values
+    high = df['High'].values
+    low = df['Low'].values
+    log_ret = np.log(df['Close'] / df['Close'].shift(1))
+    daily_vol = log_ret.rolling(20).std().values
+    n = len(close)
+    labels = np.full(n, np.nan)
+
+    for t in range(n):
+        if np.isnan(daily_vol[t]) or daily_vol[t] <= 0 or t >= n - 1:
+            continue
+        upper = close[t] * (1 + tp_mult * daily_vol[t])
+        lower = close[t] * (1 - sl_mult * daily_vol[t])
+        end = min(t + horizon, n - 1)
+        label = 0
+        for d in range(t + 1, end + 1):
+            if high[d] >= upper:
+                label = 1
+                break
+            if low[d] <= lower:
+                label = -1
+                break
+        labels[t] = label
+
+    return labels
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sample Weights
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_sample_weights(n, decay=SAMPLE_WEIGHT_DECAY):
+    weights = np.array([decay ** (n - 1 - i) for i in range(n)])
+    return weights / weights.mean()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML Filter Training
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_ml_filter(X_train, y_train, sample_weights=None):
+    """Train XGBoost + LightGBM filter (predicts P(rule signal is correct))."""
+    models = {}
+
+    pos = (y_train == 1).sum()
+    neg = (y_train == 0).sum()
+    scale = neg / max(pos, 1)
+
+    xgb_p = {**XGB_PARAMS, 'scale_pos_weight': scale}
+    xgb_m = xgb.XGBClassifier(**xgb_p)
+    xgb_m.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
+    models['xgboost'] = xgb_m
+
+    lgb_m = lgb.LGBMClassifier(**LGBM_PARAMS, is_unbalance=True)
+    lgb_m.fit(X_train, y_train, sample_weight=sample_weights)
+    models['lightgbm'] = lgb_m
+
+    return models
+
+
+def predict_ml_filter(models, X):
+    """Average probability from both models."""
+    p1 = models['xgboost'].predict_proba(X)[:, 1]
+    p2 = models['lightgbm'].predict_proba(X)[:, 1]
+    return (p1 + p2) / 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Walk-Forward CV with Rule-Based Signals + ML Filter
+# ─────────────────────────────────────────────────────────────────────────────
+
+def walk_forward_cv(strat_data, rule_directions, rule_confirmations,
+                    feature_cols, raw_df):
+    """
+    Walk-forward evaluation of the combined strategy:
+    1. Rule-based strategy generates raw signals
+    2. ML filter predicts whether each rule signal will be profitable
+    3. Only trade when rules + ML agree
+
+    Returns performance metrics and trained models.
+    """
+    # Compute ML labels (triple barrier) for the same rows
+    labels = triple_barrier_labels(strat_data)
+
+    # Build ML features from the strategy data
+    from features import build_ml_features
+    ml_data, ml_feature_cols = build_ml_features(strat_data)
+
+    # Align all arrays
+    valid_mask = ~np.isnan(labels)
+    valid_idx = np.where(valid_mask)[0]
+
+    # We need rows that have: valid labels AND valid ML features
+    ml_valid = ml_data.index.isin(strat_data.index[valid_idx])
+    ml_data_valid = ml_data[ml_valid].copy()
+
+    # Get the corresponding rule signals
+    aligned_directions = []
+    aligned_labels = []
+    aligned_indices = []
+    for i, idx in enumerate(ml_data_valid.index):
+        pos = strat_data.index.get_loc(idx)
+        if pos < len(labels) and not np.isnan(labels[pos]):
+            aligned_directions.append(rule_directions[pos])
+            aligned_labels.append(labels[pos])
+            aligned_indices.append(i)
+
+    aligned_directions = np.array(aligned_directions)
+    aligned_labels = np.array(aligned_labels)
+
+    # Binary target for ML: did the label agree with the direction?
+    # i.e., if rule said LONG (1) and barrier label was +1 → correct (1)
+    #        if rule said SHORT (-1) and barrier label was -1 → correct (1)
+    #        otherwise → incorrect (0)
+    ml_correct = np.zeros(len(aligned_directions), dtype=int)
+    for i in range(len(aligned_directions)):
+        if aligned_directions[i] == aligned_labels[i]:
+            ml_correct[i] = 1
+
+    # Filter to only rows where rules generated a signal (direction != 0)
+    has_signal = aligned_directions != 0
+    if has_signal.sum() < 100:
+        print("  ⚠ Not enough rule-generated signals for ML training")
+        return _empty_cv_result()
+
+    X_ml = ml_data_valid.iloc[aligned_indices][ml_feature_cols].values[has_signal]
+    y_ml = ml_correct[has_signal]
+    dates_ml = ml_data_valid.index[np.array(aligned_indices)[has_signal]]
+    directions_ml = aligned_directions[has_signal]
+    labels_ml = aligned_labels[has_signal]
+
+    n = len(X_ml)
+    min_train = min(TRAIN_MIN_DAYS, n // 3)
+    step = WALK_FORWARD_STEP
+    gap = CV_PURGE_GAP
+
+    print(f"\n  Walk-Forward CV: {n} signal samples, min_train={min_train}, "
+          f"step={step}, gap={gap}")
+
+    # Feature selection on first chunk
+    train_df = pd.DataFrame(X_ml[:min_train], columns=ml_feature_cols)
+    selected = select_features(train_df, y_ml[:min_train], ml_feature_cols)
+    sel_idx = [ml_feature_cols.index(f) for f in selected]
+
+    all_rule_correct = []   # Was the rule signal correct?
+    all_ml_confirms = []    # Did ML confirm the signal?
+    all_combined = []       # Was the combined strategy correct?
+    all_dates = []
+    all_directions = []
+    fold_metrics = []
+
+    last_models = None
+    last_scaler = None
+    fold = 0
+    train_end = min_train
+    start_time = time.time()
+
+    while train_end + gap + step <= n:
+        test_start = train_end + gap
+        test_end = min(test_start + step, n)
+
+        X_tr = X_ml[:train_end, :][:, sel_idx]
+        y_tr = y_ml[:train_end]
+        X_te = X_ml[test_start:test_end, :][:, sel_idx]
+        y_te = y_ml[test_start:test_end]
+
+        # Scale
+        scaler = RobustScaler()
+        X_tr_s = scaler.fit_transform(X_tr)
+        X_te_s = scaler.transform(X_te)
+
+        # Train
+        weights = compute_sample_weights(len(X_tr_s))
+        models = train_ml_filter(X_tr_s, y_tr, sample_weights=weights)
+
+        # Predict
+        ml_proba = predict_ml_filter(models, X_te_s)
+        ml_confirms = ml_proba >= ML_FILTER_THRESHOLD
+
+        # Metrics for this fold
+        rule_acc = y_te.mean()  # % of rule signals that were correct
+        ml_filtered_correct = y_te[ml_confirms]
+        ml_filtered_acc = ml_filtered_correct.mean() if len(ml_filtered_correct) > 0 else 0
+        ml_trade_pct = ml_confirms.sum() / len(ml_confirms) if len(ml_confirms) > 0 else 0
+
+        fold_metrics.append({
+            'fold': fold,
+            'rule_accuracy': rule_acc,
+            'ml_filtered_accuracy': ml_filtered_acc,
+            'ml_trade_pct': ml_trade_pct,
+            'n_test': len(y_te),
+        })
+
+        all_rule_correct.extend(y_te)
+        all_ml_confirms.extend(ml_confirms)
+        all_combined.extend(y_te[ml_confirms] if ml_confirms.sum() > 0 else [])
+        all_dates.extend(dates_ml[test_start:test_end])
+        all_directions.extend(directions_ml[test_start:test_end])
+
+        last_models = models
+        last_scaler = scaler
+        fold += 1
+        train_end = test_start + step
+
+    elapsed = time.time() - start_time
+
+    all_rule_correct = np.array(all_rule_correct)
+    all_ml_confirms = np.array(all_ml_confirms)
+
+    rule_only_acc = all_rule_correct.mean()
+    if all_ml_confirms.sum() > 0:
+        combined_acc = all_rule_correct[all_ml_confirms].mean()
+        trade_pct = all_ml_confirms.sum() / len(all_ml_confirms)
     else:
-        # CPU fallback with conservative threading to avoid oversubscription.
-        cores = os.cpu_count() or 4
-        inter_threads = max(1, min(4, cores // 2))
-        tf.config.threading.set_intra_op_parallelism_threads(cores)
-        tf.config.threading.set_inter_op_parallelism_threads(inter_threads)
-        mixed_precision.set_global_policy('float32')
-        if USE_GPU and not gpus:
-            print("⚠ USE_GPU=True but no CUDA GPU visible to TensorFlow. Falling back to CPU.")
-        print(f"✓ CPU fallback mode")
-        print(f"✓ CPU cores detected: {cores}")
-        print(f"✓ Intra-op threads: {cores}")
-        print(f"✓ Inter-op threads: {inter_threads}")
+        combined_acc = 0.0
+        trade_pct = 0.0
 
-    # XLA JIT compilation for CPU optimization
-    if USE_XLA:
-        tf.config.optimizer.set_jit(True)
-        print("✓ XLA JIT compilation enabled")
+    print(f"\n  ✓ {fold} folds in {elapsed:.1f}s")
+    print(f"  Rule-Only Accuracy:     {rule_only_acc:.1%} (on signal days)")
+    print(f"  Rule + ML Accuracy:     {combined_acc:.1%}")
+    print(f"  ML Trade Filter:        {trade_pct:.1%} of signals passed")
+    print(f"  Improvement:            {combined_acc - rule_only_acc:+.1%}")
 
-    print(f"✓ Global precision policy: {mixed_precision.global_policy().name}")
-
-    print("=" * 50 + "\n")
     return {
-        'use_gpu': use_gpu,
-        'num_gpus': len(gpus),
-        'precision_policy': mixed_precision.global_policy().name
+        'rule_accuracy': rule_only_acc,
+        'combined_accuracy': combined_acc,
+        'trade_pct': trade_pct,
+        'rule_correct': all_rule_correct,
+        'ml_confirms': all_ml_confirms,
+        'dates': all_dates,
+        'directions': np.array(all_directions) if all_directions else np.array([]),
+        'fold_metrics': fold_metrics,
+        'last_models': last_models,
+        'last_scaler': last_scaler,
+        'selected_features': selected,
+        'selected_indices': sel_idx,
+        'ml_feature_cols': ml_feature_cols,
     }
 
 
-def create_dataset(X, y, batch_size, shuffle=True, cache=True):
-    """Create optimized tf.data.Dataset for parallel loading."""
-    import tensorflow as tf
-
-    dataset = tf.data.Dataset.from_tensor_slices((X, y))
-
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=min(len(X), 10000))
-
-    dataset = dataset.batch(batch_size)
-
-    if cache:
-        dataset = dataset.cache()
-
-    dataset = dataset.prefetch(buffer_size=PREFETCH_BUFFER)
-
-    return dataset
-
-
-def build_model(input_shape):
-    """Build Bidirectional LSTM with Attention mechanism."""
-    import tensorflow as tf
-    from tensorflow.keras.models import Model
-    from tensorflow.keras.layers import (
-        Input, LSTM, Bidirectional, Dense, Dropout,
-        BatchNormalization, Multiply, Permute, Flatten, RepeatVector
-    )
-    from tensorflow.keras.optimizers import Adam
-
-    has_gpu = len(tf.config.list_physical_devices('GPU')) > 0
-    recurrent_dropout = 0.0 if has_gpu else RECURRENT_DROPOUT
-
-    if has_gpu and RECURRENT_DROPOUT > 0:
-        print("✓ GPU detected: setting recurrent_dropout=0.0 for fast cuDNN LSTM kernels")
-
-    inputs = Input(shape=input_shape)
-
-    # BiLSTM Layer 1
-    x = Bidirectional(LSTM(
-        LSTM_UNITS_1, return_sequences=True,
-        dropout=DROPOUT_RATE, recurrent_dropout=recurrent_dropout
-    ))(inputs)
-    x = BatchNormalization()(x)
-
-    # BiLSTM Layer 2
-    x = Bidirectional(LSTM(
-        LSTM_UNITS_2, return_sequences=True,
-        dropout=DROPOUT_RATE, recurrent_dropout=recurrent_dropout
-    ))(x)
-    x = BatchNormalization()(x)
-
-    # Attention mechanism
-    attn = Dense(1, activation='tanh')(x)
-    attn = Flatten()(attn)
-    attn = Dense(input_shape[0], activation='softmax')(attn)
-    attn = RepeatVector(LSTM_UNITS_2 * 2)(attn)
-    attn = Permute([2, 1])(attn)
-    x = Multiply()([x, attn])
-
-    # Final LSTM
-    x = LSTM(
-        LSTM_UNITS_3, return_sequences=False,
-        dropout=DROPOUT_RATE, recurrent_dropout=recurrent_dropout
-    )(x)
-    x = BatchNormalization()(x)
-    x = Dropout(DROPOUT_RATE)(x)
-
-    # Dense layers
-    x = Dense(32, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(DROPOUT_RATE)(x)
-    x = Dense(16, activation='relu')(x)
-    x = Dropout(DROPOUT_RATE / 2)(x)
-
-    # Output layer
-    outputs = Dense(1, activation='sigmoid')(x)
-
-    model = Model(inputs=inputs, outputs=outputs)
-    model.compile(
-        optimizer=Adam(learning_rate=LEARNING_RATE),
-        loss='binary_crossentropy',
-        metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
-    )
-
-    print("✓ Model built: BiLSTM + Attention")
-    model.summary()
-    return model
-
-
-def train(model, X_train, y_train, X_val, y_val, epochs):
-    """Train model with parallel data pipeline and callbacks."""
-    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TerminateOnNaN
-
-    print(f"\n🚀 Training (max {epochs} epochs)...")
-
-    # Class weights for imbalanced data
-    class_weights = None
-    positive_ratio = float(np.mean(y_train == 1))
-    imbalance = abs(positive_ratio - 0.5)
-    if imbalance >= 0.10:
-        classes = np.unique(y_train)
-        weights = compute_class_weight('balanced', classes=classes, y=y_train)
-        class_weights = dict(zip(classes.astype(int), weights))
-        print(f"  Class weights: {class_weights}")
-    else:
-        print("  Class weights: skipped (classes are near-balanced)")
-
-    # Optimized data pipelines
-    train_ds = create_dataset(X_train, y_train, BATCH_SIZE, shuffle=True, cache=True)
-    val_ds = create_dataset(X_val, y_val, BATCH_SIZE, shuffle=False, cache=False)
-
-    callbacks = [
-        EarlyStopping(monitor='val_auc', mode='max', patience=EARLY_STOP_PATIENCE,
-                      restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(monitor='val_auc', mode='max', factor=LR_REDUCE_FACTOR,
-                          patience=LR_REDUCE_PATIENCE, min_lr=MIN_LR, verbose=1),
-        TerminateOnNaN()
-    ]
-
-    start = time.time()
-
-    # Note: workers/multiprocessing not needed with tf.data.Dataset
-    # Parallelism is handled by tf.data pipeline and CPU threading config
-    history = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=epochs,
-        callbacks=callbacks,
-        class_weight=class_weights,
-        verbose=1
-    )
-
-    elapsed = time.time() - start
-    trained_epochs = len(history.history['accuracy'])
-
-    print(f"\n📊 Training complete:")
-    print(f"  Epochs: {trained_epochs}")
-    print(f"  Time: {elapsed:.1f}s ({elapsed/trained_epochs:.2f}s/epoch)")
-    print(f"  Best val_accuracy: {max(history.history['val_accuracy']):.2%}")
-    if 'val_auc' in history.history:
-        print(f"  Best val_auc: {max(history.history['val_auc']):.4f}")
-
-    return history
-
-
-def tune_threshold(model, X_val, y_val):
-    """Find decision threshold that maximizes validation balanced accuracy."""
-    probs = model.predict(X_val, batch_size=64, verbose=0).flatten()
-    thresholds = np.arange(0.35, 0.66, 0.01)
-
-    best_threshold = 0.5
-    best_score = -1.0
-    for t in thresholds:
-        preds = (probs >= t).astype(int)
-        score = balanced_accuracy_score(y_val, preds)
-        if score > best_score:
-            best_score = score
-            best_threshold = float(t)
-
-    print(f"\n🎚️ Threshold tuning (validation):")
-    print(f"  Best threshold: {best_threshold:.2f}")
-    print(f"  Best balanced accuracy: {best_score:.2%}")
-    return best_threshold
-
-
-def evaluate(model, X_test, y_test, threshold=0.5):
-    """Evaluate with batch prediction for speed."""
-    start = time.time()
-    probs = model.predict(X_test, batch_size=64, verbose=0).flatten()
-    preds = (probs >= threshold).astype(int)
-    elapsed = time.time() - start
-
-    print("\n📈 Evaluation:")
-    print(f"Decision threshold: {threshold:.2f}")
-    print(classification_report(y_test, preds, target_names=['DOWN', 'UP']))
-
-    cm = confusion_matrix(y_test, preds)
-    print(f"Confusion Matrix:")
-    print(f"            Pred DOWN  Pred UP")
-    print(f"  Act DOWN     {cm[0][0]:5d}    {cm[0][1]:5d}")
-    print(f"  Act UP       {cm[1][0]:5d}    {cm[1][1]:5d}")
-
-    acc = (preds == y_test).mean()
-    bal_acc = balanced_accuracy_score(y_test, preds)
-    mcc = matthews_corrcoef(y_test, preds)
-    print(f"\n  Accuracy: {acc:.2%}")
-    print(f"  Balanced Accuracy: {bal_acc:.2%}")
-    print(f"  MCC: {mcc:.4f}")
-    print(f"  Speed: {len(X_test)/elapsed:.0f} samples/sec")
-
-    # High confidence analysis
-    high_conf = (probs >= CONFIDENCE_THRESHOLD) | (probs <= 1 - CONFIDENCE_THRESHOLD)
-    if high_conf.sum() > 0:
-        hc_acc = (preds[high_conf] == y_test[high_conf]).mean()
-        print(f"  High-conf (>{CONFIDENCE_THRESHOLD:.0%}): {high_conf.sum()} samples, {hc_acc:.2%} accuracy")
-
+def _empty_cv_result():
     return {
-        'accuracy': acc,
-        'balanced_accuracy': bal_acc,
-        'mcc': mcc,
-        'predictions': preds,
-        'probabilities': probs,
+        'rule_accuracy': 0.0,
+        'combined_accuracy': 0.0,
+        'trade_pct': 0.0,
+        'rule_correct': np.array([]),
+        'ml_confirms': np.array([]),
+        'dates': [],
+        'directions': np.array([]),
+        'fold_metrics': [],
+        'last_models': None,
+        'last_scaler': None,
+        'selected_features': [],
+        'selected_indices': [],
+        'ml_feature_cols': [],
     }
 
 
-def predict(model, X_test, threshold=0.5, prediction_days=PREDICTION_DAYS):
-    """Predict next movement with confidence assessment."""
-    latest = X_test[-1].reshape(1, X_test.shape[1], X_test.shape[2])
-    prob = float(model.predict(latest, verbose=0)[0][0])
+# ─────────────────────────────────────────────────────────────────────────────
+# Final Model + Live Filter
+# ─────────────────────────────────────────────────────────────────────────────
 
-    direction = "UP" if prob >= threshold else "DOWN"
-    confidence = prob if prob >= 0.5 else 1 - prob
+def train_final_filter(strat_data, rule_directions, ml_feature_cols, sel_idx):
+    """Train ML filter on all available data for live use."""
+    from features import build_ml_features
 
-    print(f"\n🎯 PREDICTION ({prediction_days}-day):")
-    print(f"   Direction: {direction}")
-    print(f"   Confidence: {confidence:.2%}")
+    labels = triple_barrier_labels(strat_data)
+    ml_data, _ = build_ml_features(strat_data)
 
-    if confidence >= CONFIDENCE_THRESHOLD:
-        print(f"   ✅ HIGH CONFIDENCE")
-        rec = f"Strong signal: {direction}"
-    elif confidence >= 0.55:
-        print(f"   ⚠️ MODERATE CONFIDENCE")
-        rec = f"Weak signal: {direction}"
-    else:
-        print(f"   ❌ LOW CONFIDENCE")
-        rec = "No clear signal"
+    valid_mask = ~np.isnan(labels)
+    valid_idx = np.where(valid_mask)[0]
+    ml_valid = ml_data.index.isin(strat_data.index[valid_idx])
+    ml_data_valid = ml_data[ml_valid]
 
-    return {
-        'direction': direction,
-        'confidence': confidence,
-        'probability': prob,
-        'recommendation': rec,
-        'high_confidence': confidence >= CONFIDENCE_THRESHOLD
-    }
+    aligned_dirs = []
+    aligned_labels_arr = []
+    aligned_i = []
+    for i, idx in enumerate(ml_data_valid.index):
+        pos = strat_data.index.get_loc(idx)
+        if pos < len(labels) and not np.isnan(labels[pos]):
+            aligned_dirs.append(rule_directions[pos])
+            aligned_labels_arr.append(labels[pos])
+            aligned_i.append(i)
 
+    aligned_dirs = np.array(aligned_dirs)
+    aligned_labels_arr = np.array(aligned_labels_arr)
 
-def scale_data(X_train, X_val, X_test):
-    """Scale sequences (fit on train only to prevent leakage)."""
-    n_train, timesteps, n_features = X_train.shape
-    n_val = X_val.shape[0]
-    n_test = X_test.shape[0]
+    ml_correct = (aligned_dirs == aligned_labels_arr).astype(int)
+    has_signal = aligned_dirs != 0
+
+    X = ml_data_valid.iloc[np.array(aligned_i)[has_signal]][ml_feature_cols].values[:, sel_idx]
+    y = ml_correct[has_signal]
 
     scaler = RobustScaler()
-    X_train_scaled = scaler.fit_transform(X_train.reshape(-1, n_features))
-    X_val_scaled = scaler.transform(X_val.reshape(-1, n_features))
-    X_test_scaled = scaler.transform(X_test.reshape(-1, n_features))
+    X_s = scaler.fit_transform(X)
+    weights = compute_sample_weights(len(X_s))
 
-    X_train_scaled = X_train_scaled.reshape(n_train, timesteps, n_features)
-    X_val_scaled = X_val_scaled.reshape(n_val, timesteps, n_features)
-    X_test_scaled = X_test_scaled.reshape(n_test, timesteps, n_features)
+    models = train_ml_filter(X_s, y, sample_weights=weights)
+    print(f"  ✓ Final ML filter trained on {len(X)} samples")
+    return models, scaler
 
-    print("✓ Data scaled (no leakage)")
-    return X_train_scaled, X_val_scaled, X_test_scaled, scaler
+
+def apply_ml_filter(models, scaler, latest_features, sel_idx):
+    """Get ML filter probability for a single data point."""
+    X = latest_features[sel_idx].reshape(1, -1)
+    X_s = scaler.transform(X)
+    proba = predict_ml_filter(models, X_s)
+    return float(proba[0])
+
+
+def get_feature_importance(models, selected_features, top_n=10):
+    """Feature importances from ML filter models."""
+    imp = np.zeros(len(selected_features))
+    if 'xgboost' in models:
+        xi = models['xgboost'].feature_importances_
+        imp += 0.5 * (xi / max(xi.sum(), 1e-9))
+    if 'lightgbm' in models:
+        li = models['lightgbm'].feature_importances_.astype(float)
+        imp += 0.5 * (li / max(li.sum(), 1e-9))
+    idx = np.argsort(imp)[::-1][:top_n]
+    return [(selected_features[i], imp[i]) for i in idx]
